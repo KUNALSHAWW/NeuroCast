@@ -3,7 +3,7 @@ import logging
 import numpy as np
 import streamlit as st
 
-# TensorFlow / Keras imports kept inside functions where possible to reduce import-time cost
+# Keep heavy Keras/TensorFlow imports inside functions if possible
 from tensorflow.keras.preprocessing import sequence
 
 logging.basicConfig(level=logging.INFO)
@@ -15,14 +15,9 @@ MAX_LEN = 500  # must match how the model was trained
 
 @st.cache_resource
 def get_word_index():
-    """
-    Lazily fetch the IMDb word index (cached). Doing this at import time can block startup.
-    """
     try:
-        # import inside function to avoid heavy library work at import-time
         from tensorflow.keras.datasets import imdb
         word_index = imdb.get_word_index()
-        # shift indices by 3 in your pipeline, so we keep original mapping here
         reverse_word_index = {value: key for key, value in word_index.items()}
         return word_index, reverse_word_index
     except Exception:
@@ -33,27 +28,86 @@ def get_word_index():
 @st.cache_resource
 def load_tf_model(path: str = MODEL_PATH):
     """
-    Lazily load the Keras model and cache it for reuse by Streamlit.
-    load_model(..., compile=False) can be faster if you don't need to recompile.
+    Load a Keras model from HDF5 with fallbacks to handle a config mismatch
+    where older/newer Keras added 'time_major' or other kwargs that
+    the current SimpleRNN does not accept.
+
+    Strategy:
+    1) Try normal load_model(..., compile=False).
+    2) If ValueError about unrecognized kwargs (e.g. time_major), try loading
+       with a custom SimpleRNN subclass that strips 'time_major'.
+    3) If that fails, try reconstructing the model from its JSON config
+       by removing 'time_major' keys and then loading weights.
     """
     try:
         from tensorflow.keras.models import load_model
         if not os.path.exists(path):
             raise FileNotFoundError(f"Model file not found at: {path}")
-        # compile=False avoids spend on re-compiling optimizer during load
         model = load_model(path, compile=False)
-        logger.info("Model loaded successfully.")
+        logger.info("Model loaded successfully (standard load).")
         return model
-    except Exception:
-        logger.exception("Failed to load the model.")
+    except ValueError as e:
+        msg = str(e)
+        # handle the specific scenario you reported
+        if 'time_major' in msg or 'Unrecognized keyword arguments' in msg:
+            logger.warning("ValueError during load_model appears to reference 'time_major'. Trying fallback loader.")
+            try:
+                # Import tensorflow here
+                import tensorflow as tf
+
+                # Custom subclass that ignores time_major kwarg if present in config
+                class SimpleRNNNoTimeMajor(tf.keras.layers.SimpleRNN):
+                    def __init__(self, *args, **kwargs):
+                        kwargs.pop('time_major', None)
+                        super().__init__(*args, **kwargs)
+
+                from tensorflow.keras.models import load_model
+                model = load_model(path, custom_objects={'SimpleRNN': SimpleRNNNoTimeMajor}, compile=False)
+                logger.info("Model loaded successfully using SimpleRNN fallback.")
+                return model
+            except Exception:
+                logger.exception("Fallback using SimpleRNNNoTimeMajor failed; attempting config reconstruction.")
+
+                # Last-resort: load config, strip 'time_major' from JSON, rebuild model and load weights
+                try:
+                    import h5py
+                    import json
+                    from tensorflow.keras.models import model_from_json
+
+                    with h5py.File(path, 'r') as f:
+                        model_config = f.attrs.get('model_config')
+                        if model_config is None:
+                            raise RuntimeError("No model_config found in HDF5; cannot reconstruct model.")
+
+                        if isinstance(model_config, bytes):
+                            model_config = model_config.decode('utf-8')
+                        config = json.loads(model_config)
+
+                        # recursively remove any 'time_major' entries
+                        def remove_time_major(obj):
+                            if isinstance(obj, dict):
+                                obj.pop('time_major', None)
+                                for v in obj.values():
+                                    remove_time_major(v)
+                            elif isinstance(obj, list):
+                                for item in obj:
+                                    remove_time_major(item)
+
+                        remove_time_major(config)
+                        new_config_json = json.dumps(config)
+                        model = model_from_json(new_config_json)
+                        # load weights from the same file
+                        model.load_weights(path)
+                        logger.info("Model reconstructed from JSON config and weights (time_major removed).")
+                        return model
+                except Exception:
+                    logger.exception("Config-based reconstruction failed.")
+                    raise e  # re-raise original ValueError after attempts
+        # If it's some other ValueError, re-raise
         raise
 
 
 def preprocess_text(text: str, word_index: dict):
-    """
-    Convert plain text to the integer encoded/padded sequence expected by the model.
-    Keeps the same +3 offset used in the original decoding pipeline.
-    """
     if not text:
         return None
     words = text.lower().split()
@@ -67,7 +121,6 @@ def main():
     st.write("IMDB Movie Review Sentiment Analysis")
     st.write("Enter a movie review to classify it as positive or negative.")
 
-    # Load small resources lazily under a spinner so the app responds quickly
     try:
         with st.spinner("Loading vocabulary..."):
             word_index, reverse_word_index = get_word_index()
@@ -76,7 +129,6 @@ def main():
         st.exception(e)
         return
 
-    # Do not load the TF model until user presses Classify to minimize memory usage at startup.
     user_input = st.text_area("Movie Review", height=150)
 
     if st.button("Classify"):
@@ -89,11 +141,9 @@ def main():
             st.warning("Unable to preprocess input. Please try a different review.")
             return
 
-        # Load model lazily — cache_resource ensures this happens only once per session/process
         try:
             with st.spinner("Loading model and running prediction..."):
                 model = load_tf_model(MODEL_PATH)
-                # Use model.predict with verbose=0; wrap in try/except to surfacing exceptions to logs
                 preds = model.predict(preprocessed, verbose=0)
         except FileNotFoundError as fnf:
             st.error(f"Model file missing: {fnf}")
@@ -106,7 +156,6 @@ def main():
             logger.exception("Prediction failed.")
             return
 
-        # Ensure preds shape matches expectation
         try:
             score = float(preds[0][0])
             sentiment = "Positive" if score > 0.5 else "Negative"
